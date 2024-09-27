@@ -85,25 +85,39 @@ class ModelModifier:
     def calculate_snr_for_layer(self, layer_type):
         layers = [(name, module) for name, module in self.model.named_modules() if layer_type in name and hasattr(module, 'weight')]
         num_batches = (len(layers) + self.batch_size - 1) // self.batch_size
+    
+        with torch.no_grad():  # 메모리 최적화
+            with tqdm(total=num_batches, unit='batch', desc=f'Calculating SNR for {layer_type}') as progress_bar:
+                for i in range(0, len(layers), self.batch_size):
+                    batch_layers = layers[i:i + self.batch_size]
+                    for name, module in batch_layers:
+                        weights = module.weight.detach()
+                        
+                        # Ensure weights are not on the 'meta' device
+                        if weights.is_meta:
+                            weights = torch.empty(module.weight.shape, device='cpu')  # Load to CPU as an example
+    
+                        # Check for non-finite values in weights
+                        if not torch.isfinite(weights).all():
+                            print(f"Warning: Non-finite values found in weights of layer {name}. Replacing with zeros.")
+                            weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    
+                        # Perform the SNR calculations as usual
+                        if weights.ndim < 2:
+                            weights = weights.unsqueeze(0)
+                        S = torch.linalg.svdvals(weights)
+                        max_singular_value = S[0]
+                        sigma_estimated = self.estimate_sigma_with_full_iqr(S)
+                        n, m = weights.shape[-2:]
+                        mp_threshold = self.marchenko_pastur_threshold(sigma_estimated, n, m)
+                        signal = S[S > mp_threshold].sum()
+                        noise = S[S <= mp_threshold].sum()
+                        snr = signal / noise if noise != 0 else float('inf')
+                        snr_ratio = snr / max_singular_value
+                        self.layer_snr[name] = {'type': layer_type, 'snr': snr_ratio.item()}
+                    progress_bar.update(1)
 
-        with tqdm(total=num_batches, unit='batch', desc=f'Calculating SNR for {layer_type}') as progress_bar:
-            for i in range(0, len(layers), self.batch_size):
-                batch_layers = layers[i:i + self.batch_size]
-                for name, module in batch_layers:
-                    weights = module.weight.detach()
-                    if weights.ndim < 2:
-                        weights = weights.unsqueeze(0)
-                    S = torch.linalg.svdvals(weights)
-                    max_singular_value = S[0]
-                    sigma_estimated = self.estimate_sigma_with_full_iqr(S)
-                    n, m = weights.shape[-2:]
-                    mp_threshold = self.marchenko_pastur_threshold(sigma_estimated, n, m)
-                    signal = S[S > mp_threshold].sum()
-                    noise = S[S <= mp_threshold].sum()
-                    snr = signal / noise if noise != 0 else float('inf')
-                    snr_ratio = snr / max_singular_value
-                    self.layer_snr[name] = {'type': layer_type, 'snr': snr_ratio.item()}
-                progress_bar.update(1)
+
 
     @staticmethod
     def marchenko_pastur_threshold(sigma, n, m):
